@@ -1,0 +1,251 @@
+diff -ruN '--exclude=target' '--exclude=Cargo.lock' /home/key/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/dynamo-parsers-5.0.0/src/tool_calling/config.rs vendor/dynamo-parsers/src/tool_calling/config.rs
+--- /home/key/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/dynamo-parsers-5.0.0/src/tool_calling/config.rs	2006-07-24 01:21:28.000000000 +0000
++++ vendor/dynamo-parsers/src/tool_calling/config.rs	2026-07-28 18:35:57.940979447 +0000
+@@ -473,6 +473,7 @@
+                     content_style: JsonSchemaStyle::Json,
+                     tool_call_ban_tokens: vec!["<tool_call>".to_string()],
+                     reasoning_end: Some("</think>".to_string()),
++                    unconstrained_content: false,
+                 },
+             )),
+         }
+@@ -629,6 +630,7 @@
+                     content_style: JsonSchemaStyle::QwenXml,
+                     tool_call_ban_tokens: vec!["<tool_call>".to_string()],
+                     reasoning_end: Some("</think>".to_string()),
++                    unconstrained_content: false,
+                 },
+             )),
+         }
+@@ -775,10 +777,27 @@
+     ///
+     /// Bare unquoted keys, `<|"|>`-delimited strings, supports nested objects /
+     /// arrays. Multiple tool calls are concatenated without separators.
++    /// Gemma 4: `<|tool_call>call:name{key:<|"|>value<|"|>}<tool_call|>`.
++    ///
++    /// The tag body is left unconstrained on purpose — Gemma 4's argument
++    /// syntax is not JSON, so a JSON grammar inside the tag would push the
++    /// model off its trained format. The wrapper and tool name are constrained,
++    /// which is what makes a tool call reachable when the request also carries
++    /// a `response_format` JSON schema.
+     pub fn gemma4() -> Self {
+         Self {
+             parser_config: ParserConfig::Gemma4,
+-            structural_tag_builder: None,
++            structural_tag_builder: Some(StructuralTagBuilder::TriggeredTags(
++                TriggeredTagsConfig {
++                    begin_template: format!("<|tool_call>call:{}", TOOL_NAME_PLACEHOLDER),
++                    end_template: "<tool_call|>".to_string(),
++                    triggers: vec!["<|tool_call>".to_string()],
++                    content_style: JsonSchemaStyle::Json,
++                    tool_call_ban_tokens: vec!["<|tool_call>".to_string()],
++                    reasoning_end: Some("<channel|>".to_string()),
++                    unconstrained_content: true,
++                },
++            )),
+         }
+     }
+ }
+diff -ruN '--exclude=target' '--exclude=Cargo.lock' /home/key/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/dynamo-parsers-5.0.0/src/tool_calling/structural_tag/builder.rs vendor/dynamo-parsers/src/tool_calling/structural_tag/builder.rs
+--- /home/key/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/dynamo-parsers-5.0.0/src/tool_calling/structural_tag/builder.rs	2006-07-24 01:21:28.000000000 +0000
++++ vendor/dynamo-parsers/src/tool_calling/structural_tag/builder.rs	2026-07-28 18:36:26.020948100 +0000
+@@ -10,7 +10,8 @@
+ 
+ use super::dsml::{self, DsmlToolCallsConfig};
+ use super::format::{
+-    AnyTextFormat, AnyTokensFormat, Format, SequenceFormat, StructuralTag, TagFormat,
++    AnyTextFormat, AnyTokensFormat, Format, JsonSchemaFormat, JsonSchemaStyle, OptionalFormat,
++    OrFormat, Format as F, SequenceFormat, StructuralTag, TagFormat,
+ };
+ use super::triggered_tags::{self, TriggeredTagsConfig};
+ 
+@@ -128,6 +129,112 @@
+             .transpose()
+     }
+ 
++    /// Build a structural tag that accepts a schema-constrained message,
++    /// tool calls, or both — for requests that carry a `response_format` JSON
++    /// schema *and* tools.
++    ///
++    /// A bare JSON grammar accepts only the schema object, so a model that
++    /// starts a native tool call gets coerced into the JSON string and never
++    /// terminates. Constraining only the tool call instead would silently drop
++    /// the caller's schema. This emits one grammar covering every legitimate
++    /// shape:
++    ///
++    /// ```text
++    /// [ reasoning_prefix ] ( content_schema [ tool_calls ] | tool_calls )
++    /// ```
++    ///
++    /// `guided_decoding` accepts exactly one constraint, so the caller must
++    /// clear `json` when it sets this.
++    pub fn build_tool_call_format_with_content_schema(
++        &self,
++        ctx: &ToolCallFormatBuildContext<'_>,
++        content_schema: &Value,
++    ) -> anyhow::Result<Option<Value>> {
++        // Tool calls are mandatory inside their branch, so build the fragment
++        // with a forced tool choice; `Auto` would emit a triggered_tags node
++        // that also accepts arbitrary free text and lose the schema guarantee.
++        let forced_choice = match ctx.tool_choice {
++            ToolChoice::Named(name) => ToolChoice::Named(name.clone()),
++            _ => ToolChoice::Required,
++        };
++        let forced_ctx = ToolCallFormatBuildContext {
++            tool_choice: &forced_choice,
++            tools: ctx.tools,
++            parallel_tool_calls: ctx.parallel_tool_calls,
++            schema_mode: ctx.schema_mode,
++            // the reasoning prefix is applied once, around the whole union
++            starts_in_reasoning: false,
++        };
++
++        let Some(tool_calls) = (match self {
++            Self::TriggeredTags(config) => triggered_tags::build_triggered_tags(config, &forced_ctx)?,
++            Self::DsmlToolCalls(config) => dsml::build_dsml_tool_calls(config, &forced_ctx)?,
++        }) else {
++            return Ok(None);
++        };
++
++        let content = F::JsonSchema(JsonSchemaFormat {
++            json_schema: content_schema.clone(),
++            style: JsonSchemaStyle::Json,
++        });
++
++        let union = F::Or(OrFormat {
++            elements: vec![
++                // message, optionally followed by tool calls
++                F::Sequence(SequenceFormat {
++                    elements: vec![
++                        content,
++                        F::Optional(OptionalFormat {
++                            content: Box::new(tool_calls.format.clone()),
++                        }),
++                    ],
++                }),
++                // tool calls alone
++                tool_calls.format,
++            ],
++        });
++
++        let tag = self.wrap_union_reasoning_prefix(ctx, StructuralTag { format: union })?;
++        serde_json::to_value(tag).map(Some).map_err(Into::into)
++    }
++
++    /// Allow an optional leading reasoning block in front of the union.
++    ///
++    /// Both openings are accepted because the tag cannot see the prompt: the
++    /// model may open the block itself, or the chat template may have left the
++    /// prompt inside an already-open block so that only the closer is emitted.
++    fn wrap_union_reasoning_prefix(
++        &self,
++        ctx: &ToolCallFormatBuildContext<'_>,
++        suffix: StructuralTag,
++    ) -> anyhow::Result<StructuralTag> {
++        let Some(reasoning_end) = self.reasoning_end() else {
++            return Ok(suffix);
++        };
++
++        let close_only = F::Tag(TagFormat {
++            begin: String::new(),
++            content: Box::new(F::AnyText(AnyTextFormat { excludes: vec![] })),
++            end: reasoning_end.to_string(),
++        });
++
++        // A prompt that already opened the block can only emit the closer, so
++        // that branch is mandatory there; otherwise the block is optional.
++        let prefix = if ctx.starts_in_reasoning {
++            close_only
++        } else {
++            F::Optional(OptionalFormat {
++                content: Box::new(close_only),
++            })
++        };
++
++        Ok(StructuralTag {
++            format: F::Sequence(SequenceFormat {
++                elements: vec![prefix, suffix.format],
++            }),
++        })
++    }
++
+     fn wrap_reasoning_prefix_if_needed(
+         &self,
+         ctx: &ToolCallFormatBuildContext<'_>,
+diff -ruN '--exclude=target' '--exclude=Cargo.lock' /home/key/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/dynamo-parsers-5.0.0/src/tool_calling/structural_tag/format.rs vendor/dynamo-parsers/src/tool_calling/structural_tag/format.rs
+--- /home/key/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/dynamo-parsers-5.0.0/src/tool_calling/structural_tag/format.rs	2006-07-24 01:21:28.000000000 +0000
++++ vendor/dynamo-parsers/src/tool_calling/structural_tag/format.rs	2026-07-28 18:35:38.596001039 +0000
+@@ -47,6 +47,22 @@
+     AnyTokens(AnyTokensFormat),
+     /// `{"type": "any_text", "excludes": [...]}`
+     AnyText(AnyTextFormat),
++    /// `{"type": "or", "elements": [...]}` — matches any one of the branches.
++    Or(OrFormat),
++    /// `{"type": "optional", "content": ...}` — matches the content 0 or 1 time.
++    Optional(OptionalFormat),
++}
++
++/// `or`: alternation between formats.
++#[derive(Debug, Clone, Serialize)]
++pub struct OrFormat {
++    pub elements: Vec<Format>,
++}
++
++/// `optional`: the content may appear once or not at all.
++#[derive(Debug, Clone, Serialize)]
++pub struct OptionalFormat {
++    pub content: Box<Format>,
+ }
+ 
+ /// `tag` format: `begin + content + end`.
+diff -ruN '--exclude=target' '--exclude=Cargo.lock' /home/key/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/dynamo-parsers-5.0.0/src/tool_calling/structural_tag/triggered_tags.rs vendor/dynamo-parsers/src/tool_calling/structural_tag/triggered_tags.rs
+--- /home/key/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/dynamo-parsers-5.0.0/src/tool_calling/structural_tag/triggered_tags.rs	2006-07-24 01:21:28.000000000 +0000
++++ vendor/dynamo-parsers/src/tool_calling/structural_tag/triggered_tags.rs	2026-07-28 18:35:57.939979448 +0000
+@@ -10,7 +10,8 @@
+ use super::TOOL_NAME_PLACEHOLDER;
+ use super::builder::{ToolCallFormatBuildContext, resolve_tool_schema, resolve_tools_to_include};
+ use super::format::{
+-    Format, JsonSchemaFormat, JsonSchemaStyle, StructuralTag, TagFormat, TriggeredTagsFormat,
++    AnyTextFormat, Format, JsonSchemaFormat, JsonSchemaStyle, StructuralTag, TagFormat,
++    TriggeredTagsFormat,
+ };
+ 
+ /// Configuration for `triggered_tags` formats where each tool is a tag.
+@@ -39,6 +40,14 @@
+     /// Closing tag for prompt-injected reasoning, if this parser supports it.
+     #[serde(default)]
+     pub reasoning_end: Option<String>,
++
++    /// Leave the tag body unconstrained instead of applying a JSON schema.
++    ///
++    /// Required for models whose argument syntax is not JSON — Gemma 4 writes
++    /// `key:<|"|>value<|"|>`, so a JSON grammar inside the tag would force it
++    /// off its trained format. The wrapper and tool name are still constrained.
++    #[serde(default)]
++    pub unconstrained_content: bool,
+ }
+ 
+ /// Build a `triggered_tags` structural tag from config and request context.
+@@ -62,12 +71,18 @@
+                 .begin_template
+                 .replace(TOOL_NAME_PLACEHOLDER, &tool.name);
+ 
+-            TagFormat {
+-                begin,
+-                content: Box::new(Format::JsonSchema(JsonSchemaFormat {
++            let content = if config.unconstrained_content {
++                Format::AnyText(AnyTextFormat { excludes: vec![] })
++            } else {
++                Format::JsonSchema(JsonSchemaFormat {
+                     json_schema: resolve_tool_schema(tool, strict_schema),
+                     style: config.content_style,
+-                })),
++                })
++            };
++
++            TagFormat {
++                begin,
++                content: Box::new(content),
+                 end: config.end_template.clone(),
+             }
+         })

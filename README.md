@@ -65,6 +65,7 @@ Constraining arguments as JSON would push the model off its trained format, and 
 | `tests/e2e_schema_suppression.py` | does adding a schema suppress a tool the model provably calls? |
 | `tests/raw_output_under_constraints.py` | raw generation under each constraint, via `/v1/completions` |
 | `repro_simplismart_json_toolcall.py` | client-side acceptance check (3 scenarios, PASS/FAIL) |
+| `dynamo_fix/` | Rust patches for NVIDIA Dynamo (`dynamo-parsers` + `dynamo-llm`) with build steps and results |
 | `FIX_gemma4_json_plus_tools.md` | full write-up: root cause, patch, deployment, dynamo notes |
 
 ## Install
@@ -113,7 +114,7 @@ Notes:
 - `google/gemma-4-31B-it-assistant` is the MTP **draft** model — it belongs in
   `--speculative-config.model`, not `--model`.
 
-## Does this work under NVIDIA Dynamo? Not in the default topology
+## NVIDIA Dynamo: fixed separately in Rust (`dynamo_fix/`)
 
 Tested with `ai-dynamo` 1.3.0.post1 (etcd + NATS, `dynamo.vllm` worker, `dynamo.frontend`),
 gemma-4-31B-it, patch installed:
@@ -132,8 +133,14 @@ gemma-4-31B-it, patch installed:
   works) but dynamo delivers it as *content* rather than `tool_calls`, because vLLM 0.26's gemma4
   parser is engine-based while `prepost.py` drives reasoning and tool parsing separately.
 
-`vllm serve` is verified end to end (9/9). Dynamo needs one of: a Rust-side union tag, or
-streaming tool extraction fixed on the Python-processor path.
+**Both gaps are now fixed in Rust — see `dynamo_fix/`.** `dynamo-parsers` gets a real structural
+tag builder for gemma4 (it had none, which is why `--dyn-enable-structural-tag` did nothing) plus
+the union composition; `dynamo-llm` stops bailing out of constraint selection when a
+`response_format` is present alongside tools. Verified through `dynamo.frontend` + `dynamo.vllm`
+with no extra launch flags: the two tool scenarios went **0/4 → 4/4** and the follow-up envelope
+**4/4**. Details, build steps, and the one behavioural caveat are in `dynamo_fix/README.md`.
+
+`vllm serve` remains verified end to end at 9/9.
 
 ## Third fix: `<turn|>` leaks into streamed content
 

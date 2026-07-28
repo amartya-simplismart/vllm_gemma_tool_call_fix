@@ -1,0 +1,130 @@
+diff --git a/lib/llm/src/preprocessor/structural_tag.rs b/lib/llm/src/preprocessor/structural_tag.rs
+index adb59c4896..a0697f0dbb 100644
+--- a/lib/llm/src/preprocessor/structural_tag.rs
++++ b/lib/llm/src/preprocessor/structural_tag.rs
+@@ -63,7 +63,7 @@ impl OpenAIPreprocessor {
+     }
+ 
+     /// Find the structural tag builder for a parser, if supported.
+-    fn structural_tag_builder_for_parser(
++    pub(super) fn structural_tag_builder_for_parser(
+         parser_name: &str,
+     ) -> Option<&'static dynamo_parsers::tool_calling::StructuralTagBuilder> {
+         let parser_map = dynamo_parsers::tool_calling::parsers::get_tool_parser_map();
+diff --git a/lib/llm/src/preprocessor/tool_choice.rs b/lib/llm/src/preprocessor/tool_choice.rs
+index 5a156d0c05..3a9396df31 100644
+--- a/lib/llm/src/preprocessor/tool_choice.rs
++++ b/lib/llm/src/preprocessor/tool_choice.rs
+@@ -7,7 +7,7 @@ use crate::preprocessor::{OpenAIPreprocessor, PreprocessedRequest};
+ use crate::protocols::openai::chat_completions::NvCreateChatCompletionRequest;
+ use crate::protocols::openai::tools::get_json_schema_from_tools;
+ 
+-use dynamo_parsers::tool_calling::{ToolChoice, ToolDefinition};
++use dynamo_parsers::tool_calling::{ToolCallFormatBuildContext, ToolChoice, ToolDefinition};
+ use dynamo_protocols::types::{ChatCompletionTool, ChatCompletionToolChoiceOption, ResponseFormat};
+ use dynamo_runtime::error::{DynamoError, ErrorType};
+ 
+@@ -55,6 +55,28 @@ impl OpenAIPreprocessor {
+         let has_assistant_constraint =
+             has_explicit_guided_decoding || has_response_format_constraint;
+         if !is_forced_tool_choice && has_assistant_constraint {
++            // Leaving the content constraint as the only grammar is not neutral
++            // when tools are present: it accepts nothing but the schema object,
++            // so a model that opens a native tool call is coerced into the JSON
++            // string and never terminates (the request then burns its whole
++            // token budget and the client gets a malformed object and no tool
++            // call). Emit one grammar that accepts either channel instead.
++            if let Some(tag) = self.build_content_plus_tool_calls_tag(
++                request,
++                common_request,
++                tool_choice,
++                tools,
++                prompt_injected_reasoning,
++            )? {
++                let gd = common_request
++                    .sampling_options
++                    .guided_decoding
++                    .get_or_insert_default();
++                // guided_decoding accepts exactly one constraint
++                gd.json = None;
++                gd.structural_tag = Some(tag);
++                return Ok(true);
++            }
+             return Ok(false);
+         }
+ 
+@@ -94,6 +116,74 @@ impl OpenAIPreprocessor {
+         // tool-choice JSON fallback were needed.
+         Ok(false)
+     }
++
++    /// Build a union tag accepting the `response_format` schema, tool calls, or
++    /// both, for a non-forced tool choice that also constrains content.
++    ///
++    /// Returns `Ok(None)` when this does not apply — no tools, no JSON schema
++    /// to preserve, no tool-call parser, or a parser without a structural tag
++    /// builder — leaving the caller's existing behaviour untouched.
++    fn build_content_plus_tool_calls_tag(
++        &self,
++        request: &NvCreateChatCompletionRequest,
++        common_request: &PreprocessedRequest,
++        tool_choice: &ChatCompletionToolChoiceOption,
++        tools: &[ChatCompletionTool],
++        prompt_injected_reasoning: bool,
++    ) -> Result<Option<serde_json::Value>, DynamoError> {
++        if tools.is_empty() {
++            return Ok(None);
++        }
++
++        // Only a JSON-schema content constraint can be composed into a tag.
++        let Some(schema) = common_request
++            .sampling_options
++            .guided_decoding
++            .as_ref()
++            .and_then(|gd| gd.json.clone())
++        else {
++            return Ok(None);
++        };
++
++        let Some(parser_name) = self.tool_call_parser.as_deref() else {
++            return Ok(None);
++        };
++        let Some(builder) = Self::structural_tag_builder_for_parser(parser_name) else {
++            return Ok(None);
++        };
++
++        let converted_choice = convert_tool_choice(tool_choice);
++        let converted_tools = convert_tools(tools);
++        let ctx = ToolCallFormatBuildContext {
++            tool_choice: &converted_choice,
++            tools: &converted_tools,
++            parallel_tool_calls: request.inner.parallel_tool_calls,
++            schema_mode: self.runtime_config.structural_tag_schema,
++            starts_in_reasoning: prompt_injected_reasoning,
++        };
++
++        let tag = builder
++            .build_tool_call_format_with_content_schema(&ctx, &schema)
++            .map_err(|e| {
++                DynamoError::builder()
++                    .error_type(ErrorType::Unknown)
++                    .message(format!(
++                        "failed to build content+tool_calls structural tag for parser \
++                         '{parser_name}': {e}"
++                    ))
++                    .build()
++            })?;
++
++        if tag.is_some() {
++            tracing::debug!(
++                parser = parser_name,
++                "response_format + tools: replaced the JSON constraint with a \
++                 content-or-tool-calls structural tag"
++            );
++        }
++
++        Ok(tag)
++    }
+ }
+ 
+ fn has_explicit_guided_decoding(request: &NvCreateChatCompletionRequest) -> bool {
