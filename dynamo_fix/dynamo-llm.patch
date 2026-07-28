@@ -12,7 +12,7 @@ index adb59c4896..a0697f0dbb 100644
      ) -> Option<&'static dynamo_parsers::tool_calling::StructuralTagBuilder> {
          let parser_map = dynamo_parsers::tool_calling::parsers::get_tool_parser_map();
 diff --git a/lib/llm/src/preprocessor/tool_choice.rs b/lib/llm/src/preprocessor/tool_choice.rs
-index 5a156d0c05..3a9396df31 100644
+index 5a156d0c05..f8bf71c950 100644
 --- a/lib/llm/src/preprocessor/tool_choice.rs
 +++ b/lib/llm/src/preprocessor/tool_choice.rs
 @@ -7,7 +7,7 @@ use crate::preprocessor::{OpenAIPreprocessor, PreprocessedRequest};
@@ -53,7 +53,7 @@ index 5a156d0c05..3a9396df31 100644
              return Ok(false);
          }
  
-@@ -94,6 +116,74 @@ impl OpenAIPreprocessor {
+@@ -94,6 +116,81 @@ impl OpenAIPreprocessor {
          // tool-choice JSON fallback were needed.
          Ok(false)
      }
@@ -73,6 +73,13 @@ index 5a156d0c05..3a9396df31 100644
 +        prompt_injected_reasoning: bool,
 +    ) -> Result<Option<serde_json::Value>, DynamoError> {
 +        if tools.is_empty() {
++            return Ok(None);
++        }
++
++        // `tool_choice: "none"` means the client does not want tool calls at all;
++        // offering a tool branch would let the model emit one anyway. Leave this
++        // case to the existing tool-call-ban handling.
++        if matches!(tool_choice, ChatCompletionToolChoiceOption::None) {
 +            return Ok(None);
 +        }
 +

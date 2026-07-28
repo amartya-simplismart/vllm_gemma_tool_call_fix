@@ -138,7 +138,8 @@ tag builder for gemma4 (it had none, which is why `--dyn-enable-structural-tag` 
 the union composition; `dynamo-llm` stops bailing out of constraint selection when a
 `response_format` is present alongside tools. Verified through `dynamo.frontend` + `dynamo.vllm`
 with no extra launch flags: the two tool scenarios went **0/4 → 4/4** and the follow-up envelope
-**4/4**. Details, build steps, and the one behavioural caveat are in `dynamo_fix/README.md`.
+**4/4**. Details, build steps, and how to fix the remaining non-tool-turn behaviour (per-turn
+`tool_choice: "none"` — 3/3 — or a stricter prompt — 3/3) are in `dynamo_fix/README.md`.
 
 `vllm serve` remains verified end to end at 9/9.
 

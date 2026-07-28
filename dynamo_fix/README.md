@@ -132,6 +132,39 @@ regression:
 - SquadStack's runtime already handles a tool-only turn (the envelope then comes from the follow-up
   request), so it is not a protocol violation — only an assertion in the acceptance script.
 
-If envelope-only turns must be guaranteed, that belongs in the prompt or in a per-turn
-`tool_choice: "none"` from the client, not in the grammar — forcing it back into the grammar is
-exactly the bug this patch removes.
+### Fixing scenario A — two levers, both measured
+
+Scenario A is a policy question ("should the model act on this turn?"), so the fix belongs in the
+prompt or in the per-turn `tool_choice`, not in the grammar. Both were tested on
+gemma-4-31B-it through patched dynamo, 3 runs each, same non-tool turn:
+
+| approach | envelope | tool called |
+|---|---|---|
+| baseline: `auto` + the repro's compact prompt | 1/3 | 2/3 |
+| **`tool_choice: "none"` on non-tool turns** | **3/3** | **0/3** |
+| **stricter prompt + `auto`** | **3/3** | **0/3** |
+
+**1. Per-turn `tool_choice: "none"` (hard guarantee).** The runtime already knows the call stage,
+so it can send `none` on turns where no tool is permitted. The tag logged on the way to vLLM shows
+no tool branch at all in that case, so this is enforced by the grammar rather than left to the
+model's judgment. Tool turns keep `auto` and still fire 3/3.
+
+This exposed a bug in the first version of this patch: the union was also being built for
+`tool_choice: "none"`, so the tool branch was still offered and the model merely happened not to
+take it. The patch now returns early for `None`, and the logged tag confirms `tool_branch=false`.
+
+**2. Stricter prompt (better judgment, no client change).** The repro's stand-in prompt says only
+*"Call fetch_seller_details when the buyer asks about the seller/supplier"*. Adding an explicit
+negative rule fixed it 3/3 with `auto`:
+
+```
+- Call fetch_seller_details ONLY when the buyer explicitly asks about the seller/supplier.
+  NEVER call it in STAGE_INTRO or to answer a question about the buyer's own enquiry.
+  If no tool is clearly required, do not call any tool — just reply with the JSON object.
+```
+
+The production campaign prompt (~15K tokens) very likely already carries rules of this kind, which
+is a further reason to re-measure scenario A against the real prompt rather than the stand-in.
+
+Recommended: use both — the prompt for judgment, and `tool_choice: "none"` on stages where a tool
+call is definitionally wrong, for a guarantee that does not depend on model behaviour.
