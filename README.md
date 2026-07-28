@@ -112,6 +112,28 @@ Notes:
 - `google/gemma-4-31B-it-assistant` is the MTP **draft** model — it belongs in
   `--speculative-config.model`, not `--model`.
 
+## Does this work under NVIDIA Dynamo? Not in the default topology
+
+Tested with `ai-dynamo` 1.3.0.post1 (etcd + NATS, `dynamo.vllm` worker, `dynamo.frontend`),
+gemma-4-31B-it, patch installed:
+
+- **Default Rust frontend** — `--dyn-tool-call-parser` selects a *Rust* parser
+  (`dynamo-parsers/src/tool_calling/gemma4/parser.rs`), the Rust ingress builds
+  `guided_decoding` itself, and vLLM's Python `adjust_request` is never called. Result: **1/3,
+  identical to unpatched.** `--dyn-enable-structural-tag --dyn-structural-tag-scope always` does
+  not help (0/2 with a schema), and a client-supplied `response_format: {"type":"structural_tag"}`
+  is rejected with HTTP 400 `unknown variant`. There is currently no configuration that makes it
+  work — the union tag has to be emitted by dynamo's Rust constraint selection, which already
+  plumbs `guided_decoding.structural_tag` to the worker.
+- **`--dyn-chat-processor vllm`** (Python processor) — `prepost.py` *does* call
+  `adjust_request()` on the class from `ToolParserManager`, so the patch runs. Non-streaming
+  **passes** with clean arguments. Streaming generates the native tool call (the grammar fix
+  works) but dynamo delivers it as *content* rather than `tool_calls`, because vLLM 0.26's gemma4
+  parser is engine-based while `prepost.py` drives reasoning and tool parsing separately.
+
+`vllm serve` is verified end to end (9/9). Dynamo needs one of: a Rust-side union tag, or
+streaming tool extraction fixed on the Python-processor path.
+
 ## Third fix: `<turn|>` leaks into streamed content
 
 `TURN_END` (`<turn|>`) is not one of the Gemma 4 parser's terminals, and the parser engine sets

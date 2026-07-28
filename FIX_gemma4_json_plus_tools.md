@@ -252,58 +252,82 @@ model emits reasoning text and only the **closer** `<channel|>`, never the opene
 accepts both openings; without that, request 2 would have been rejected by its own grammar
 whenever thinking was enabled. Covered by the last two rows of the builder self-test (11/11).
 
-## Does dynamo affect this?
+## Does dynamo affect this? Yes — measured, and it blocks the fix
 
-Two parts of dynamo matter, one a lot:
+Tested for real: `ai-dynamo` 1.3.0.post1 + `ai-dynamo-runtime` 1.3.0.post1, etcd + NATS running
+locally, `python -m dynamo.vllm` worker serving gemma-4-31B-it (TP=2) with
+`--dyn-tool-call-parser gemma4 --dyn-reasoning-parser gemma4`, plus `python -m dynamo.frontend`.
+The vLLM patch was installed throughout.
 
-**1. Whether the patch runs at all — verify this first.** The flags are `--dyn-tool-call-parser`
-/ `--dyn-reasoning-parser`, i.e. **dynamo-owned**, not vLLM's own `--tool-call-parser`. So
-dynamo is selecting the parser class through its own code path, and everything here depends on
-one question: does that path call `ToolParser.adjust_request()`?
+### 1. Default (Rust) frontend — the production topology: the patch never runs
 
-- If it does (directly, or by going through vLLM's `online_renderer`, which calls it at
-  `renderers/online_renderer.py:388-419`), the patch takes effect with no dynamo change.
-- If dynamo only uses the *parsing* side (`extract_tool_calls` / `extract_tool_calls_streaming`)
-  and builds sampling params itself from the OpenAI request, then `adjust_request` is never
-  called, the patch is dead code, and the same translation has to go where dynamo maps
-  `response_format` → structured output.
+`--dyn-tool-call-parser` resolves to a **Rust** parser
+(`dynamo._core.get_tool_parser_names()` contains `gemma4`/`gemma-4`; the binary carries
+`dynamo-parsers-5.0.0/src/tool_calling/gemma4/parser.rs`). The Rust ingress does templating and
+builds `sampling_options.guided_decoding` itself, so vLLM's Python
+`Gemma4EngineToolParser.adjust_request` is never on the request path.
 
-I could not check this here — dynamo isn't installed on this machine, only vLLM 0.26.0. On the
-serving box:
+Measured through dynamo, acceptance script: **1/3 — identical to unpatched.** Controls confirm
+the model is willing (`no response_format` + auto fires 2/2 through dynamo) and that the schema is
+the cause (`json_schema` + auto: **0/2**).
+
+Neither available knob helps:
+
+| attempt | result |
+|---|---|
+| the vLLM patch (this repo) | no effect — bypassed |
+| `--dyn-enable-structural-tag --dyn-structural-tag-scope always` | still 0/2 on `json_schema` + auto |
+| client sends `response_format: {"type":"structural_tag", …}` | HTTP 400 `unknown variant 'structural_tag', expected one of 'text', 'json_object', 'json_schema'` |
+
+So on dynamo's Rust frontend there is currently **no configuration** that makes tool calls survive
+a `json_schema` response format. The fix has to land where the Rust preprocessing maps
+`response_format` → `guided_decoding.json`: emit a union structural tag instead when `tools` are
+present. `guided_decoding.structural_tag` is already plumbed through to the worker
+(`dynamo/vllm/handlers.py:747-756`), and the Rust core already builds xgrammar structural tags
+(`triggered_tags`, `any_text` appear in the binary) — so this is a change in the Rust
+constraint-selection logic, and `server_fix/vllm/tool_parsers/gemma4_structural_tag.py` is the
+reference for the tag to emit. Note `StructuredOutputsParams` accepts exactly one constraint, so
+it must be *one* union tag, not schema + tag side by side.
+
+Also observed: with `--dyn-enable-structural-tag` on, `no schema` + `tool_choice: required`
+regressed to 0/2 (it is 2/2 with the flag off). Worth reporting upstream separately.
+
+### 2. `--dyn-chat-processor vllm` (Python processor): the patch runs, streaming is the blocker
+
+Dynamo's Python processor path *does* call `tool_parser.adjust_request()`
+(`dynamo/frontend/prepost.py:126`) with the class from `ToolParserManager.get_tool_parser()`
+(`dynamo/frontend/vllm_processor.py:880`) — i.e. the patched one. Launch:
 
 ```bash
-DYN=$(python3 -c 'import dynamo.vllm, os; print(os.path.dirname(dynamo.vllm.__file__))')
-grep -rn "adjust_request" $DYN                       # is it called on the request path?
-grep -rn "structured_outputs\|response_format\|guided" $DYN   # where the constraint is built
-grep -rn "dyn_tool_call_parser\|tool_call_parser" $DYN        # how the parser is wired in
+python -m dynamo.frontend --http-port 8090 --dyn-chat-processor vllm \
+    --model-path <model> --model-name gemma4 \
+    --tool-call-parser gemma4 --reasoning-parser gemma4 --enable-auto-tool-choice
 ```
 
-Runtime probe after deploying — the patch logs the swap, so this is definitive:
+| mode | result |
+|---|---|
+| **non-streaming** | **PASS** — `hangup_call_with_custom_delay({"delay": 6, "message": "ठीक है…"})`, clean args |
+| streaming | tool call is now *generated* — raw `<|tool_call>call:hangup_call_with_custom_delay{delay:6,message:<|"|>…}` — but arrives as **content**, not `tool_calls` |
 
-```bash
-VLLM_LOGGING_LEVEL=DEBUG python3 -m dynamo.vllm … 2>&1 | grep "replaced json_schema constraint"
-```
+The grammar half of the fix demonstrably works here (that native tool call was impossible before —
+it was being swallowed into the envelope). What fails is dynamo's streaming *extraction*: vLLM
+0.26's gemma4 parser is engine-based (`engine_based_streaming = True`) and expects to drive
+reasoning and tool parsing as one state machine, while `prepost.py` runs the reasoning parser
+first and then hands content to the tool parser. Since SquadStack always streams, this path needs
+that gap closed before it is usable.
 
-One line per affected request means the fix is live. Silence while scenario B still fails means
-dynamo bypasses `adjust_request`, and the translation belongs in dynamo's request preprocessing
-instead — the builder module is independent of vLLM's request classes, so it can be called from
-there unchanged; only `_extract_json_schema` / `_clear_json_schema` / `_tool_names` need
-re-pointing at whatever request object dynamo hands over.
+### Net
 
-**2. Speculative decoding, which dynamo is configuring here.** The `-assistant` draft makes
-spec decoding load-bearing in this deployment, and it is the one dynamo-side setting that
-genuinely interacts with the fix: the structured-output bitmask has to be applied to draft
-tokens as well, and the shipped gemma4 parser explicitly avoids guided decoding for forced tool
-choice because it *"crashes EngineCore under speculative decoding"*. Run the acceptance matrix
-with the draft model loaded, at `--max-num-seqs 8`. If it destabilizes, drop
-`--speculative-config.*` to confirm the grammar itself is fine, then fix the spec-decode +
-structured-output interaction — do not conclude the grammar is wrong.
+The vLLM fix in this repo is correct and verified against `vllm serve` (9/9), but **dynamo does
+not pick it up in the default topology**. Options, in order of practicality:
 
-Everything else dynamo does here is orthogonal to the grammar: the KV router and
-`--kv-events-config`, prefix caching and `--prefix-warmup-file`, `--compilation-config` /
-cudagraph capture sizes. The grammar is per-request generation-time masking; it neither reads
-nor invalidates the KV cache, and a prefix-cache hit does not carry a matcher state across
-requests.
+1. Fix dynamo's Rust constraint selection to emit the union tag (right long-term fix; needs a
+   dynamo build). The tag shape and rationale are in this repo.
+2. Use `--dyn-chat-processor vllm` **and** fix streaming tool extraction for engine-based parsers
+   in `prepost.py`. Non-streaming already works today with the patch.
+3. Bypass dynamo's frontend for this workload and point the pipecat runtime at vLLM's own
+   OpenAI server, where the fix is verified end to end — losing dynamo's routing and KV-aware
+   scheduling.
 
 One product decision worth confirming with SquadStack: on the **follow-up** request (scenario
 C2) the tools are sent again, so tool-only output is legal there too and the model could chain a
