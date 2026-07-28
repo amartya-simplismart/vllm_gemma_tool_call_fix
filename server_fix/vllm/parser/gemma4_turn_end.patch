@@ -1,0 +1,27 @@
+--- a/vllm/parser/gemma4.py
++++ b/vllm/parser/gemma4.py
+@@ constants @@
+ TOOL_CALL_START = "<|tool_call>"
+ TOOL_CALL_END = "<tool_call|>"
++TURN_END = "<turn|>"
+ STRING_DELIM = '<|"|>'
+
+@@ Gemma4Parser._events_to_delta @@
+         delta = super()._events_to_delta(events, finished=finished)
+-        if delta is None or delta.reasoning is None:
++        if delta is None:
+             return delta
++
++        # TURN_END is not one of this parser's terminals, so with skip_special_tokens=False
++        # (set by the parser engine so <|tool_call> survives detokenization) it flows through
++        # as content on the streaming path. Clients that json.loads() the streamed content
++        # then fail on the trailing marker.
++        if delta.content and TURN_END in delta.content:
++            delta.content = delta.content.replace(TURN_END, "")
++            if not delta.content and delta.reasoning is None and not delta.tool_calls:
++                return None
++
++        if delta.reasoning is None:
++            return delta
+ 
+         if self._prefix_stripped:
