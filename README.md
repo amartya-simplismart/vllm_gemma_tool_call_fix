@@ -79,8 +79,9 @@ patch -p2 -d $V < server_fix/vllm/parser/gemma4_turn_end.patch
 python3 server_fix/test_gemma4_adjust_request.py
 ```
 
-`--tool-call-parser gemma4` / `--dyn-tool-call-parser gemma4` resolves through vLLM's lazy
-registry to `Gemma4EngineToolParser`, so no launch-flag or dynamo changes are needed.
+`--tool-call-parser gemma4` resolves through vLLM's lazy registry to `Gemma4EngineToolParser`, so
+no launch-flag changes are needed for `vllm serve`. **Under NVIDIA Dynamo this is not enough** —
+see the dynamo section below.
 
 ## Verified on `gemma-4-31B-it`
 
