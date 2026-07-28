@@ -48,7 +48,7 @@ diff -ruN '--exclude=target' '--exclude=Cargo.lock' /home/key/.cargo/registry/sr
  }
 diff -ruN '--exclude=target' '--exclude=Cargo.lock' /home/key/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/dynamo-parsers-5.0.0/src/tool_calling/structural_tag/builder.rs vendor/dynamo-parsers/src/tool_calling/structural_tag/builder.rs
 --- /home/key/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/dynamo-parsers-5.0.0/src/tool_calling/structural_tag/builder.rs	2006-07-24 01:21:28.000000000 +0000
-+++ vendor/dynamo-parsers/src/tool_calling/structural_tag/builder.rs	2026-07-28 18:36:26.020948100 +0000
++++ vendor/dynamo-parsers/src/tool_calling/structural_tag/builder.rs	2026-07-28 19:23:26.685735241 +0000
 @@ -10,7 +10,8 @@
  
  use super::dsml::{self, DsmlToolCallsConfig};
@@ -59,7 +59,7 @@ diff -ruN '--exclude=target' '--exclude=Cargo.lock' /home/key/.cargo/registry/sr
  };
  use super::triggered_tags::{self, TriggeredTagsConfig};
  
-@@ -128,6 +129,112 @@
+@@ -128,6 +129,123 @@
              .transpose()
      }
  
@@ -112,16 +112,27 @@ diff -ruN '--exclude=target' '--exclude=Cargo.lock' /home/key/.cargo/registry/sr
 +            style: JsonSchemaStyle::Json,
 +        });
 +
++        // With a forced tool choice the caller demands a call, so the message may
++        // precede one but must not stand alone.
++        let tools_are_mandatory = matches!(
++            ctx.tool_choice,
++            ToolChoice::Required | ToolChoice::Named(_)
++        );
++        let content_then_tools = if tools_are_mandatory {
++            vec![content, tool_calls.format.clone()]
++        } else {
++            vec![
++                content,
++                F::Optional(OptionalFormat {
++                    content: Box::new(tool_calls.format.clone()),
++                }),
++            ]
++        };
++
 +        let union = F::Or(OrFormat {
 +            elements: vec![
-+                // message, optionally followed by tool calls
 +                F::Sequence(SequenceFormat {
-+                    elements: vec![
-+                        content,
-+                        F::Optional(OptionalFormat {
-+                            content: Box::new(tool_calls.format.clone()),
-+                        }),
-+                    ],
++                    elements: content_then_tools,
 +                }),
 +                // tool calls alone
 +                tool_calls.format,

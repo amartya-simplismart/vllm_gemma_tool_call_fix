@@ -12,7 +12,7 @@ index adb59c4896..a0697f0dbb 100644
      ) -> Option<&'static dynamo_parsers::tool_calling::StructuralTagBuilder> {
          let parser_map = dynamo_parsers::tool_calling::parsers::get_tool_parser_map();
 diff --git a/lib/llm/src/preprocessor/tool_choice.rs b/lib/llm/src/preprocessor/tool_choice.rs
-index 5a156d0c05..f8bf71c950 100644
+index 5a156d0c05..0b48c6ec3a 100644
 --- a/lib/llm/src/preprocessor/tool_choice.rs
 +++ b/lib/llm/src/preprocessor/tool_choice.rs
 @@ -7,7 +7,7 @@ use crate::preprocessor::{OpenAIPreprocessor, PreprocessedRequest};
@@ -24,7 +24,7 @@ index 5a156d0c05..f8bf71c950 100644
  use dynamo_protocols::types::{ChatCompletionTool, ChatCompletionToolChoiceOption, ResponseFormat};
  use dynamo_runtime::error::{DynamoError, ErrorType};
  
-@@ -55,6 +55,28 @@ impl OpenAIPreprocessor {
+@@ -55,15 +55,76 @@ impl OpenAIPreprocessor {
          let has_assistant_constraint =
              has_explicit_guided_decoding || has_response_format_constraint;
          if !is_forced_tool_choice && has_assistant_constraint {
@@ -53,10 +53,106 @@ index 5a156d0c05..f8bf71c950 100644
              return Ok(false);
          }
  
-@@ -94,6 +116,81 @@ impl OpenAIPreprocessor {
+-        if is_forced_tool_choice
+-            && has_response_format_constraint
+-            && let Some(gd) = common_request.sampling_options.guided_decoding.as_mut()
+-        {
+-            // OpenAI `response_format` applies to assistant content, not tool calls.
+-            gd.json = None;
++        if is_forced_tool_choice {
++            // A forced tool choice must produce the model's *native* tool-call syntax. The
++            // `get_json_schema_from_tools` fallback below constrains output to a generic JSON
++            // tool-call object, which is simply wrong for a model whose wire format is not JSON
++            // (Gemma 4 emits `<|tool_call>call:name{...}<tool_call|>`): the model is forced into
++            // a shape its parser cannot read and the turn is lost. When the parser ships a
++            // structural tag builder, that builder knows the real format — prefer it, whether or
++            // not tag mode was explicitly enabled.
++            if let Some(tag) = self.build_content_plus_tool_calls_tag(
++                request,
++                common_request,
++                tool_choice,
++                tools,
++                prompt_injected_reasoning,
++            )? {
++                let gd = common_request
++                    .sampling_options
++                    .guided_decoding
++                    .get_or_insert_default();
++                gd.json = None;
++                gd.structural_tag = Some(tag);
++                return Ok(true);
++            }
++
++            if let Some(tag) = self.build_native_tool_call_tag(
++                request,
++                tool_choice,
++                tools,
++                prompt_injected_reasoning,
++            )? {
++                let gd = common_request
++                    .sampling_options
++                    .guided_decoding
++                    .get_or_insert_default();
++                gd.json = None;
++                gd.structural_tag = Some(tag);
++                return Ok(true);
++            }
++
++            if has_response_format_constraint
++                && let Some(gd) = common_request.sampling_options.guided_decoding.as_mut()
++            {
++                // OpenAI `response_format` applies to assistant content, not tool calls.
++                gd.json = None;
++            }
+         }
+ 
+         if self.apply_tool_choice_structural_tag(
+@@ -94,6 +155,123 @@ impl OpenAIPreprocessor {
          // tool-choice JSON fallback were needed.
          Ok(false)
      }
++
++    /// Build the parser's native tool-call tag for a forced tool choice.
++    ///
++    /// Returns `Ok(None)` when the parser has no structural tag builder, leaving
++    /// the existing JSON-schema fallback in place.
++    fn build_native_tool_call_tag(
++        &self,
++        request: &NvCreateChatCompletionRequest,
++        tool_choice: &ChatCompletionToolChoiceOption,
++        tools: &[ChatCompletionTool],
++        prompt_injected_reasoning: bool,
++    ) -> Result<Option<serde_json::Value>, DynamoError> {
++        if tools.is_empty() {
++            return Ok(None);
++        }
++        let Some(parser_name) = self.tool_call_parser.as_deref() else {
++            return Ok(None);
++        };
++        let Some(builder) = Self::structural_tag_builder_for_parser(parser_name) else {
++            return Ok(None);
++        };
++
++        let converted_choice = convert_tool_choice(tool_choice);
++        let converted_tools = convert_tools(tools);
++        let ctx = ToolCallFormatBuildContext {
++            tool_choice: &converted_choice,
++            tools: &converted_tools,
++            parallel_tool_calls: request.inner.parallel_tool_calls,
++            schema_mode: self.runtime_config.structural_tag_schema,
++            starts_in_reasoning: prompt_injected_reasoning,
++        };
++
++        builder.build_tool_call_format(&ctx).map_err(|e| {
++            DynamoError::builder()
++                .error_type(ErrorType::Unknown)
++                .message(format!(
++                    "failed to build native tool-call structural tag for parser \
++                     '{parser_name}': {e}"
++                ))
++                .build()
++        })
++    }
 +
 +    /// Build a union tag accepting the `response_format` schema, tool calls, or
 +    /// both, for a non-forced tool choice that also constrains content.

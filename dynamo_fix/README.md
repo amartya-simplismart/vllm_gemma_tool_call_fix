@@ -9,7 +9,7 @@ launch flags** (see "Results" below).
 
 ## What was wrong, in Dynamo
 
-Two separate gaps:
+Three separate gaps:
 
 1. **`dynamo-parsers`: gemma4 had no structural tag builder at all** —
    `ToolCallConfig::gemma4()` set `structural_tag_builder: None`, so
@@ -32,6 +32,14 @@ Two separate gaps:
    the JSON string and never terminates: the request burns its whole token budget and the client
    gets a malformed object and no tool call.
 
+3. **`dynamo-llm`: forced tool choice falls back to a generic JSON tool-call shape.** With tag
+   mode off (the default), `tool_choice: "required"` or a named tool routes to
+   `get_json_schema_from_tools`, which constrains output to an OpenAI-style JSON tool-call object.
+   Gemma 4 does not speak that — it emits `<|tool_call>call:name{...}<tool_call|>` — so the model
+   is forced into a shape its own parser cannot read and the turn is lost. Measured before the fix:
+   a named `tool_choice` returned `{\n  \n  \n  …` filler and zero tool calls. This is the same
+   trap vLLM's gemma4 parser avoids by skipping guided decoding entirely for forced choice.
+
 ## The patches
 
 | File | Change |
@@ -52,6 +60,9 @@ The grammar emitted (verified by logging what reaches vLLM):
 Both openings of the reasoning block are accepted, because the tag cannot see the prompt: the
 model may open the channel itself, or the chat template may leave the prompt inside an already
 open block so only the closer is emitted.
+
+Under a forced tool choice (`required` or named) the message branch may still precede a call but
+cannot stand alone, so the `[ tool_calls ]` above becomes mandatory.
 
 Returns `Ok(None)` — leaving existing behaviour untouched — when there are no tools, no JSON
 schema to preserve, no `--dyn-tool-call-parser`, or a parser without a tag builder. No new launch
@@ -110,6 +121,13 @@ plus `python -m dynamo.frontend --http-port 8090`, streaming client.
 | C1: fetch turn → tool must fire | 0/4 | **4/4** |
 | C2: follow-up → schema-conforming envelope | n/a | **4/4** |
 | A: non-tool turn → envelope only | 4/4 | 1/4 — see below |
+
+Forced tool choice, same server (3 runs, `../client_fix/verify_scenario_a.py` config 3, which
+sends a named `tool_choice` on the single-tool stage):
+
+| | before | after |
+|---|---|---|
+| named `tool_choice` + `response_format` | 0/3 — `{\n  \n  …` filler | **3/3** native call |
 
 B and C were previously **impossible**; they now pass every run, with clean typed arguments
 (`{"delay":6,"message":"ठीक है, कोई बात नहीं। अपना ख्याल रखिये, बाय!"}`) and a follow-up envelope

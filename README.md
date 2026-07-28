@@ -66,6 +66,7 @@ Constraining arguments as JSON would push the model off its trained format, and 
 | `tests/raw_output_under_constraints.py` | raw generation under each constraint, via `/v1/completions` |
 | `repro_simplismart_json_toolcall.py` | client-side acceptance check (3 scenarios, PASS/FAIL) |
 | `dynamo_fix/` | Rust patches for NVIDIA Dynamo (`dynamo-parsers` + `dynamo-llm`) with build steps and results |
+| `client_fix/` | per-turn `tool_choice` policy + prompt gating, so speech-only turns stay speech-only |
 | `FIX_gemma4_json_plus_tools.md` | full write-up: root cause, patch, deployment, dynamo notes |
 
 ## Install
@@ -138,8 +139,13 @@ tag builder for gemma4 (it had none, which is why `--dyn-enable-structural-tag` 
 the union composition; `dynamo-llm` stops bailing out of constraint selection when a
 `response_format` is present alongside tools. Verified through `dynamo.frontend` + `dynamo.vllm`
 with no extra launch flags: the two tool scenarios went **0/4 → 4/4** and the follow-up envelope
-**4/4**. Details, build steps, and how to fix the remaining non-tool-turn behaviour (per-turn
-`tool_choice: "none"` — 3/3 — or a stricter prompt — 3/3) are in `dynamo_fix/README.md`.
+**4/4**. A third dynamo bug surfaced while testing this and is fixed in the same patch: with tag mode off,
+a forced (`required` / named) `tool_choice` fell back to a generic JSON tool-call shape that
+Gemma 4 does not speak, producing filler and no tool call — now 3/3 native calls.
+
+Details and build steps are in `dynamo_fix/README.md`. The remaining non-tool-turn behaviour is a
+policy question, fixed client-side in `client_fix/` (per-turn `tool_choice` and prompt gating,
+each 9/9).
 
 `vllm serve` remains verified end to end at 9/9.
 
